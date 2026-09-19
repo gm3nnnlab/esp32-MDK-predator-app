@@ -1,0 +1,945 @@
+diff --git a/firmware/application/external/external.cmake b/firmware/application/external/external.cmake
+index 6f928e9..98c4a6c 100644
+--- a/firmware/application/external/external.cmake
++++ b/firmware/application/external/external.cmake
+@@ -411,6 +411,10 @@ set(EXTCPPSRC
+ 	external/sdusb/main.cpp
+ 	external/sdusb/ui_sd_over_usb.cpp
+ 
++	#predator - RX-only security research toolkit for the Mayhem MDK module
++	external/predator/main.cpp
++	external/predator/ui_predator.cpp
++
+ )
+ 
+ set(EXTAPPLIST
+@@ -510,4 +514,5 @@ set(EXTAPPLIST
+ 	aprs_rx
+ 	aprs_tx
+ 	sdusb
++	predator
+ )
+diff --git a/firmware/application/external/external.ld b/firmware/application/external/external.ld
+index 79824d7..82cd46a 100644
+--- a/firmware/application/external/external.ld
++++ b/firmware/application/external/external.ld
+@@ -119,6 +119,7 @@ MEMORY
+     ram_external_app_ais_rx                (rwx) : org = 0xAE0E0000, len = 32k
+     ram_external_app_aprs_rx               (rwx) : org = 0xAE0F0000, len = 32k
+     ram_external_app_aprs_tx               (rwx) : org = 0xAE100000, len = 32k
++    ram_external_app_predator              (rwx) : org = 0xAE110000, len = 32k
+ }
+ 
+ SECTIONS
+@@ -699,6 +700,10 @@ SECTIONS
+         *(*ui*external_app*aprs_tx*);
+     } > ram_external_app_aprs_tx
+ 
+-
++    .external_app_predator : ALIGN(4) SUBALIGN(4)
++    {
++        KEEP(*(.external_app.app_predator.application_information));
++        */external/predator/*(*ui*external_app*predator*);
++    } > ram_external_app_predator
+ 
+ }
+diff --git a/firmware/application/external/predator/main.cpp b/firmware/application/external/predator/main.cpp
+new file mode 100644
+index 0000000..371eb6a
+--- /dev/null
++++ b/firmware/application/external/predator/main.cpp
+@@ -0,0 +1,86 @@
++/*
++ * Predator - RX-only security research toolkit for the Mayhem MDK module.
++ *
++ * Scope, by design: WiFi scanning, Bluetooth/BLE discovery, and SubGHz
++ * signal capture / generic protocol decode (including common key-fob ISM
++ * bands). This app is receive-only. It does not transmit, replay, brute
++ * force, or otherwise attempt to defeat rolling-code or any other access
++ * control system, and it has no RFID/NFC features.
++ *
++ * Only use this on systems you own or have explicit permission to test.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include "ui.hpp"
++#include "ui_predator.hpp"
++#include "ui_navigation.hpp"
++#include "external_app.hpp"
++
++namespace ui::external_app::predator {
++void initialize_app(ui::NavigationView& nav) {
++    nav.push<PredatorAppView>();
++}
++}  // namespace ui::external_app::predator
++
++extern "C" {
++
++__attribute__((section(".external_app.app_predator.application_information"), used)) application_information_t _application_information_predator = {
++    /*.memory_location = */ (uint8_t*)0x00000000,
++    /*.externalAppEntry = */ ui::external_app::predator::initialize_app,
++    /*.header_version = */ CURRENT_HEADER_VERSION,
++    /*.app_version = */ VERSION_MD5,
++
++    /*.app_name = */ "Predator",
++    /*.bitmap_data = */
++    {
++        0x00,
++        0x00,
++        0xE0,
++        0x03,
++        0x18,
++        0x0C,
++        0x04,
++        0x10,
++        0x02,
++        0x20,
++        0x02,
++        0x20,
++        0xE2,
++        0x23,
++        0x22,
++        0x22,
++        0x22,
++        0x22,
++        0xE2,
++        0x23,
++        0x02,
++        0x20,
++        0x02,
++        0x20,
++        0x04,
++        0x10,
++        0x18,
++        0x0C,
++        0xE0,
++        0x03,
++        0x00,
++        0x00},
++    /*.icon_color = */ ui::Color::orange().v,
++    /*.menu_location = */ app_location_t::RX,
++    /*.desired_menu_position = */ -1,
++
++    // Biggest baseband image this app touches: raw capture. The AM-audio
++    // image used by the decode screen is requested dynamically at runtime.
++    /*.m4_app_tag = portapack::spi_flash::image_tag_capture */ {'P', 'C', 'A', 'P'},
++    /*.m4_app_offset = */ 0x00000000,  // will be filled at compile time
++};
++}
+diff --git a/firmware/application/external/predator/ui_predator.cpp b/firmware/application/external/predator/ui_predator.cpp
+new file mode 100644
+index 0000000..a77688d
+--- /dev/null
++++ b/firmware/application/external/predator/ui_predator.cpp
+@@ -0,0 +1,400 @@
++/*
++ * Predator - RX-only security research toolkit for the Mayhem MDK module.
++ * See ui_predator.hpp for the scope note.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include "ui_predator.hpp"
++
++#include <cstring>
++
++#include "portapack.hpp"
++#include "receiver_model.hpp"
++#include "string_format.hpp"
++
++// Reused verbatim - no new baseband/DSP code is introduced by this app.
++#include "capture_app.hpp"
++#include "ui_subghzd.hpp"
++
++using namespace portapack;
++
++namespace ui::external_app::predator {
++
++i2cdev::I2cDev_PPmod* get_module() {
++    auto* dev = i2cdev::I2CDevManager::get_dev_by_model(I2CDECMDL_PPMOD);
++    return static_cast<i2cdev::I2cDev_PPmod*>(dev);
++}
++
++// ---------------------------------------------------------------------------
++// PredatorAppView
++// ---------------------------------------------------------------------------
++PredatorAppView::PredatorAppView(NavigationView& nav)
++    : nav_{nav} {
++    add_children({
++        &text_title,
++        &text_subtitle,
++        &button_wifi,
++        &button_ble,
++        &button_subghz,
++        &button_decode,
++        &text_module_state,
++    });
++
++    button_wifi.on_select = [this](Button&) {
++        nav_.push<PredatorWifiView>();
++    };
++    button_ble.on_select = [this](Button&) {
++        nav_.push<PredatorBleView>();
++    };
++    button_subghz.on_select = [this](Button&) {
++        nav_.push<PredatorBandPickerView>(PredatorBandTarget::Capture);
++    };
++    button_decode.on_select = [this](Button&) {
++        nav_.push<PredatorBandPickerView>(PredatorBandTarget::Decode);
++    };
++
++    update_module_state();
++}
++
++void PredatorAppView::focus() {
++    button_wifi.focus();
++    update_module_state();
++}
++
++void PredatorAppView::update_module_state() {
++    auto* mod = get_module();
++    if (mod) {
++        text_module_state.set("MDK module detected");
++    } else {
++        text_module_state.set("No MDK module - WiFi/BT unavailable");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// PredatorBandPickerView
++// ---------------------------------------------------------------------------
++PredatorBandPickerView::PredatorBandPickerView(NavigationView& nav, PredatorBandTarget target)
++    : nav_{nav}, target_{target} {
++    add_children({
++        &text_hint,
++        &button_315,
++        &button_433,
++        &button_868,
++        &button_915,
++        &button_custom,
++    });
++
++    button_315.on_select = [this](Button&) { choose(315'000'000); };
++    button_433.on_select = [this](Button&) { choose(433'920'000); };
++    button_868.on_select = [this](Button&) { choose(868'350'000); };
++    button_915.on_select = [this](Button&) { choose(915'000'000); };
++    button_custom.on_select = [this](Button&) { choose(0); };
++}
++
++void PredatorBandPickerView::focus() {
++    button_433.focus();
++}
++
++void PredatorBandPickerView::choose(uint32_t frequency_hz) {
++    if (target_ == PredatorBandTarget::Capture) {
++        // Stock, unmodified Capture app: raw IQ capture to SD + spectrum/RSSI.
++        nav_.push<CaptureAppView>();
++    } else {
++        // Stock, unmodified SubGhzD app: generic OOK/FSK protocol decode.
++        nav_.push<SubGhzDView>();
++    }
++    if (frequency_hz != 0) {
++        // Retune after the target view has applied its own defaults, exactly
++        // like turning the on-screen frequency knob would.
++        receiver_model.set_target_frequency(frequency_hz);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// PredatorWifiView
++// ---------------------------------------------------------------------------
++PredatorWifiView::PredatorWifiView(NavigationView& nav)
++    : nav_{nav} {
++    add_children({
++        &button_scan,
++        &text_status,
++        &recent_entries_view,
++    });
++
++    recent_entries_view.set_parent_rect({0, header_height, screen_width, screen_height - header_height});
++
++    button_scan.on_select = [this](Button&) { start_stop(); };
++
++    if (!get_module()) {
++        button_scan.set_focusable(false);
++    } else {
++        text_status.set("Ready");
++    }
++}
++
++PredatorWifiView::~PredatorWifiView() {
++    if (scanning_) {
++        auto* mod = get_module();
++        if (mod) mod->predator_wifi_stop_scan();
++    }
++}
++
++void PredatorWifiView::focus() {
++    button_scan.focus();
++}
++
++void PredatorWifiView::start_stop() {
++    auto* mod = get_module();
++    if (!mod) {
++        text_status.set("No MDK module detected");
++        return;
++    }
++
++    if (!scanning_) {
++        recent.clear();
++        recent_entries_view.set_dirty();
++        next_fetch_index_ = 0;
++        known_total_ = 0;
++
++        mod->lockDevice();
++        bool ok = mod->predator_wifi_start_scan();
++        mod->unlockDevice();
++
++        if (!ok) {
++            text_status.set("Failed to start scan");
++            return;
++        }
++        scanning_ = true;
++        button_scan.set_text("Stop Scan");
++        text_status.set("Scanning...");
++    } else {
++        mod->lockDevice();
++        mod->predator_wifi_stop_scan();
++        mod->unlockDevice();
++        scanning_ = false;
++        button_scan.set_text("Start Scan");
++        text_status.set(known_total_ == 0 ? "No networks found" : "Scan stopped");
++    }
++}
++
++void PredatorWifiView::poll_results() {
++    auto* mod = get_module();
++    if (!mod) return;
++
++    mod->lockDevice();
++    auto rec = mod->predator_wifi_get_result(next_fetch_index_);
++    mod->unlockDevice();
++
++    if (!rec.has_value() || !rec->valid) {
++        // Nothing new yet (or the scan finished with fewer results than we
++        // already have) - just wait for the next tick.
++        return;
++    }
++
++    known_total_ = rec->total_count;
++
++    uint64_t key = 0;
++    memcpy(&key, rec->bssid, 6);
++
++    auto matching = find(recent, key);
++    WifiApRecentEntry entry{key};
++    entry.ssid = rec->ssid[0] ? std::string(rec->ssid) : "(hidden)";
++    memcpy(entry.bssid, rec->bssid, 6);
++    entry.rssi = rec->rssi;
++    entry.channel = rec->channel;
++    entry.authmode = rec->authmode;
++
++    if (matching != std::end(recent)) {
++        *matching = entry;
++    } else {
++        recent.push_back(entry);
++    }
++    recent_entries_view.set_dirty();
++
++    next_fetch_index_++;
++    if (next_fetch_index_ >= known_total_) {
++        next_fetch_index_ = 0;  // wrap around to refresh RSSI on already-seen APs
++    }
++}
++
++void PredatorWifiView::on_tick() {
++    if (!scanning_) return;
++    // Poll roughly every ~6 frames (about 3-4 times a second) rather than
++    // hammering the I2C bus on every redraw.
++    if (++poll_divider_ < 6) return;
++    poll_divider_ = 0;
++    poll_results();
++}
++
++// ---------------------------------------------------------------------------
++// PredatorBleView
++// ---------------------------------------------------------------------------
++PredatorBleView::PredatorBleView(NavigationView& nav)
++    : nav_{nav} {
++    add_children({
++        &button_scan,
++        &text_status,
++        &recent_entries_view,
++    });
++
++    recent_entries_view.set_parent_rect({0, header_height, screen_width, screen_height - header_height});
++
++    button_scan.on_select = [this](Button&) { start_stop(); };
++
++    if (!get_module()) {
++        button_scan.set_focusable(false);
++    } else {
++        text_status.set("Ready");
++    }
++}
++
++PredatorBleView::~PredatorBleView() {
++    if (scanning_) {
++        auto* mod = get_module();
++        if (mod) mod->predator_ble_stop_scan();
++    }
++}
++
++void PredatorBleView::focus() {
++    button_scan.focus();
++}
++
++void PredatorBleView::start_stop() {
++    auto* mod = get_module();
++    if (!mod) {
++        text_status.set("No MDK module detected");
++        return;
++    }
++
++    if (!scanning_) {
++        recent.clear();
++        recent_entries_view.set_dirty();
++        next_fetch_index_ = 0;
++        known_total_ = 0;
++
++        mod->lockDevice();
++        bool ok = mod->predator_ble_start_scan();
++        mod->unlockDevice();
++
++        if (!ok) {
++            text_status.set("Failed to start scan");
++            return;
++        }
++        scanning_ = true;
++        button_scan.set_text("Stop Scan");
++        text_status.set("Scanning...");
++    } else {
++        mod->lockDevice();
++        mod->predator_ble_stop_scan();
++        mod->unlockDevice();
++        scanning_ = false;
++        button_scan.set_text("Start Scan");
++        text_status.set(known_total_ == 0 ? "No devices found" : "Scan stopped");
++    }
++}
++
++void PredatorBleView::poll_results() {
++    auto* mod = get_module();
++    if (!mod) return;
++
++    mod->lockDevice();
++    auto rec = mod->predator_ble_get_result(next_fetch_index_);
++    mod->unlockDevice();
++
++    if (!rec.has_value() || !rec->valid) {
++        return;
++    }
++
++    known_total_ = rec->total_count;
++
++    uint64_t key = 0;
++    memcpy(&key, rec->addr, 6);
++
++    auto matching = find(recent, key);
++    BleDeviceRecentEntry entry{key};
++    entry.name = rec->name[0] ? std::string(rec->name) : "(no name)";
++    memcpy(entry.addr, rec->addr, 6);
++    entry.rssi = rec->rssi;
++    entry.addr_type = rec->addr_type;
++
++    if (matching != std::end(recent)) {
++        *matching = entry;
++    } else {
++        recent.push_back(entry);
++    }
++    recent_entries_view.set_dirty();
++
++    next_fetch_index_++;
++    if (next_fetch_index_ >= known_total_) {
++        next_fetch_index_ = 0;
++    }
++}
++
++void PredatorBleView::on_tick() {
++    if (!scanning_) return;
++    if (++poll_divider_ < 6) return;
++    poll_divider_ = 0;
++    poll_results();
++}
++
++// ---------------------------------------------------------------------------
++// Row rendering
++// ---------------------------------------------------------------------------
++namespace {
++std::string format_mac(const uint8_t* addr) {
++    std::string s{};
++    s.reserve(17);
++    for (int i = 0; i < 6; i++) {
++        if (i) s += ":";
++        s += to_string_hex(addr[i], 2);
++    }
++    return s;
++}
++}  // namespace
++
++}  // namespace ui::external_app::predator
++
++namespace ui {
++
++template <>
++void RecentEntriesTable<ui::external_app::predator::WifiApRecentEntries>::draw(
++    const Entry& entry,
++    const Rect& target_rect,
++    Painter& painter,
++    const Style& style,
++    RecentEntriesColumns& columns) {
++    std::string line = entry.ssid == "(hidden)" ? (entry.ssid + " " + external_app::predator::format_mac(entry.bssid)) : entry.ssid;
++    line.resize(columns.at(0).second, ' ');
++    std::string chStr = to_string_dec_uint(entry.channel);
++    line += chStr + std::string(columns.at(1).second > chStr.length() ? columns.at(1).second - chStr.length() : 0, ' ');
++    line += to_string_dec_int(entry.rssi);
++    line.resize(target_rect.width() / 8, ' ');
++    painter.draw_string(target_rect.location(), style, line);
++}
++
++template <>
++void RecentEntriesTable<ui::external_app::predator::BleDeviceRecentEntries>::draw(
++    const Entry& entry,
++    const Rect& target_rect,
++    Painter& painter,
++    const Style& style,
++    RecentEntriesColumns& columns) {
++    std::string line = entry.name == "(no name)" ? external_app::predator::format_mac(entry.addr) : entry.name;
++    line.resize(columns.at(0).second, ' ');
++    std::string tyStr = to_string_dec_uint(entry.addr_type);
++    line += tyStr + std::string(columns.at(1).second > tyStr.length() ? columns.at(1).second - tyStr.length() : 0, ' ');
++    line += to_string_dec_int(entry.rssi);
++    line.resize(target_rect.width() / 8, ' ');
++    painter.draw_string(target_rect.location(), style, line);
++}
++
++}  // namespace ui
+diff --git a/firmware/application/external/predator/ui_predator.hpp b/firmware/application/external/predator/ui_predator.hpp
+new file mode 100644
+index 0000000..1101ede
+--- /dev/null
++++ b/firmware/application/external/predator/ui_predator.hpp
+@@ -0,0 +1,253 @@
++/*
++ * Predator - RX-only security research toolkit for the Mayhem MDK module.
++ *
++ * WiFi scan and Bluetooth/BLE discovery are bridged to the MDK external
++ * module (ESP32-S3) over the existing I2cDev_PPmod link. SubGHz capture and
++ * decode reuse the stock, already-shipped Capture and SubGhzD apps verbatim
++ * (this app only offers quick frequency presets for common ISM / key-fob
++ * bands before handing off to them) - no new baseband/DSP code is added
++ * here, and nothing in this app transmits.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __UI_PREDATOR_H__
++#define __UI_PREDATOR_H__
++
++#include "ui.hpp"
++#include "ui_widget.hpp"
++#include "ui_navigation.hpp"
++#include "recent_entries.hpp"
++#include "i2cdev_ppmod.hpp"
++
++#include <string>
++
++namespace ui::external_app::predator {
++
++// ---------------------------------------------------------------------------
++// Shared helper: look up the MDK module driver, if one is plugged in.
++// ---------------------------------------------------------------------------
++i2cdev::I2cDev_PPmod* get_module();
++
++// ---------------------------------------------------------------------------
++// Main menu
++// ---------------------------------------------------------------------------
++class PredatorAppView : public View {
++   public:
++    PredatorAppView(NavigationView& nav);
++
++    void focus() override;
++    std::string title() const override { return "Predator"; };
++
++   private:
++    NavigationView& nav_;
++
++    Text text_title{
++        {0, 0, screen_width, 16},
++        "Predator - RX security toolkit"};
++
++    Text text_subtitle{
++        {0, 16, screen_width, 16},
++        "Scan / capture only - your own gear"};
++
++    Button button_wifi{
++        {0, 40, screen_width, 32},
++        "WiFi Scan"};
++
++    Button button_ble{
++        {0, 76, screen_width, 32},
++        "Bluetooth Discovery"};
++
++    Button button_subghz{
++        {0, 112, screen_width, 32},
++        "SubGHz Capture (incl. key fobs)"};
++
++    Button button_decode{
++        {0, 148, screen_width, 32},
++        "Signal Decode (incl. key fobs)"};
++
++    Text text_module_state{
++        {0, 190, screen_width, 16},
++        ""};
++
++    void update_module_state();
++};
++
++// ---------------------------------------------------------------------------
++// Frequency preset helper used by both the SubGHz capture and decode screens.
++// Presets cover the common license-free ISM bands most key fobs, garage/gate
++// remotes, weather sensors, and similar SubGHz devices use.
++// ---------------------------------------------------------------------------
++enum class PredatorBandTarget {
++    Capture,  // hands off to the stock CaptureAppView
++    Decode    // hands off to the stock SubGhzDView
++};
++
++class PredatorBandPickerView : public View {
++   public:
++    PredatorBandPickerView(NavigationView& nav, PredatorBandTarget target);
++
++    void focus() override;
++    std::string title() const override {
++        return target_ == PredatorBandTarget::Capture ? "SubGHz Capture" : "Signal Decode";
++    };
++
++   private:
++    NavigationView& nav_;
++    PredatorBandTarget target_;
++
++    void choose(uint32_t frequency_hz);
++
++    Text text_hint{
++        {0, 0, screen_width, 16},
++        "Pick a band, then capture/decode"};
++
++    Button button_315{{0, 24, screen_width, 28}, "315.000 MHz (fob/remote)"};
++    Button button_433{{0, 56, screen_width, 28}, "433.920 MHz (fob/remote)"};
++    Button button_868{{0, 88, screen_width, 28}, "868.350 MHz (fob/remote)"};
++    Button button_915{{0, 120, screen_width, 28}, "915.000 MHz (fob/remote)"};
++    Button button_custom{{0, 152, screen_width, 28}, "Custom / tune manually"};
++};
++
++// ---------------------------------------------------------------------------
++// WiFi scan
++// ---------------------------------------------------------------------------
++struct WifiApRecentEntry {
++    using Key = uint64_t;
++    static constexpr Key invalid_key = 0xFFFFFFFFFFFFFFFFull;
++
++    uint64_t bssid_key{invalid_key};
++    std::string ssid{};
++    uint8_t bssid[6]{0, 0, 0, 0, 0, 0};
++    int8_t rssi{0};
++    uint8_t channel{0};
++    uint8_t authmode{0};
++
++    WifiApRecentEntry() {}
++    WifiApRecentEntry(Key key) : bssid_key{key} {}
++
++    Key key() const { return bssid_key; }
++};
++using WifiApRecentEntries = RecentEntries<WifiApRecentEntry>;
++using WifiApRecentEntriesView = RecentEntriesView<WifiApRecentEntries>;
++
++class PredatorWifiView : public View {
++   public:
++    PredatorWifiView(NavigationView& nav);
++    ~PredatorWifiView();
++
++    void focus() override;
++    std::string title() const override { return "WiFi Scan"; };
++
++   private:
++    NavigationView& nav_;
++
++    bool scanning_{false};
++    uint8_t poll_divider_{0};
++    uint16_t next_fetch_index_{0};
++    uint16_t known_total_{0};
++
++    WifiApRecentEntries recent{};
++
++    void start_stop();
++    void poll_results();
++    void on_tick();
++
++    Button button_scan{
++        {0, 0, screen_width, 24},
++        "Start Scan"};
++
++    Text text_status{
++        {0, 24, screen_width, 16},
++        "Module not detected"};
++
++    static constexpr auto header_height = 40;
++
++    RecentEntriesColumns columns{{
++        {"SSID / BSSID", 22},
++        {"Ch", 3},
++        {"RSSI", 5},
++    }};
++    WifiApRecentEntriesView recent_entries_view{columns, recent};
++
++    MessageHandlerRegistration message_handler_frame_sync{
++        Message::ID::DisplayFrameSync,
++        [this](const Message* const) { this->on_tick(); }};
++};
++
++// ---------------------------------------------------------------------------
++// Bluetooth / BLE discovery
++// ---------------------------------------------------------------------------
++struct BleDeviceRecentEntry {
++    using Key = uint64_t;
++    static constexpr Key invalid_key = 0xFFFFFFFFFFFFFFFFull;
++
++    uint64_t addr_key{invalid_key};
++    std::string name{};
++    uint8_t addr[6]{0, 0, 0, 0, 0, 0};
++    int8_t rssi{0};
++    uint8_t addr_type{0};
++
++    BleDeviceRecentEntry() {}
++    BleDeviceRecentEntry(Key key) : addr_key{key} {}
++
++    Key key() const { return addr_key; }
++};
++using BleDeviceRecentEntries = RecentEntries<BleDeviceRecentEntry>;
++using BleDeviceRecentEntriesView = RecentEntriesView<BleDeviceRecentEntries>;
++
++class PredatorBleView : public View {
++   public:
++    PredatorBleView(NavigationView& nav);
++    ~PredatorBleView();
++
++    void focus() override;
++    std::string title() const override { return "Bluetooth Discovery"; };
++
++   private:
++    NavigationView& nav_;
++
++    bool scanning_{false};
++    uint8_t poll_divider_{0};
++    uint16_t next_fetch_index_{0};
++    uint16_t known_total_{0};
++
++    BleDeviceRecentEntries recent{};
++
++    void start_stop();
++    void poll_results();
++    void on_tick();
++
++    Button button_scan{
++        {0, 0, screen_width, 24},
++        "Start Scan"};
++
++    Text text_status{
++        {0, 24, screen_width, 16},
++        "Module not detected"};
++
++    static constexpr auto header_height = 40;
++
++    RecentEntriesColumns columns{{
++        {"Address / Name", 22},
++        {"Typ", 3},
++        {"RSSI", 5},
++    }};
++    BleDeviceRecentEntriesView recent_entries_view{columns, recent};
++
++    MessageHandlerRegistration message_handler_frame_sync{
++        Message::ID::DisplayFrameSync,
++        [this](const Message* const) { this->on_tick(); }};
++};
++
++}  // namespace ui::external_app::predator
++
++#endif /*__UI_PREDATOR_H__*/
+diff --git a/firmware/common/i2cdev_ppmod.cpp b/firmware/common/i2cdev_ppmod.cpp
+index 668437a..239370b 100644
+--- a/firmware/common/i2cdev_ppmod.cpp
++++ b/firmware/common/i2cdev_ppmod.cpp
+@@ -242,6 +242,54 @@ std::vector<uint8_t> I2cDev_PPmod::downloadStandaloneApp(uint32_t index, size_t
+     return ret;
+ }
+ 
++// --- Predator app support --------------------------------------------------
++
++bool I2cDev_PPmod::predator_wifi_start_scan() {
++    if (isLocked()) return false;
++    Command cmd = Command::COMMAND_PREDATOR_WIFI_STARTSCAN;
++    return i2c_read((uint8_t*)&cmd, 2, nullptr, 0);
++}
++
++bool I2cDev_PPmod::predator_wifi_stop_scan() {
++    if (isLocked()) return false;
++    Command cmd = Command::COMMAND_PREDATOR_WIFI_STOPSCAN;
++    return i2c_read((uint8_t*)&cmd, 2, nullptr, 0);
++}
++
++std::optional<I2cDev_PPmod::predator_wifi_record_t> I2cDev_PPmod::predator_wifi_get_result(uint16_t index) {
++    if (isLocked()) return std::nullopt;
++    // Low 16 bits: command. High 16 bits: requested record index. Same packing
++    // convention as COMMAND_APP_INFO above.
++    uint32_t data = (uint32_t)Command::COMMAND_PREDATOR_WIFI_GETRESULT + ((uint32_t)index << 16);
++    I2cDev_PPmod::predator_wifi_record_t rec{};
++    bool success = i2c_read((uint8_t*)&data, sizeof(data), (uint8_t*)&rec, sizeof(rec));
++    if (!success) return std::nullopt;
++    rec.ssid[sizeof(rec.ssid) - 1] = 0;  // never trust the far end for termination
++    return rec;
++}
++
++bool I2cDev_PPmod::predator_ble_start_scan() {
++    if (isLocked()) return false;
++    Command cmd = Command::COMMAND_PREDATOR_BLE_STARTSCAN;
++    return i2c_read((uint8_t*)&cmd, 2, nullptr, 0);
++}
++
++bool I2cDev_PPmod::predator_ble_stop_scan() {
++    if (isLocked()) return false;
++    Command cmd = Command::COMMAND_PREDATOR_BLE_STOPSCAN;
++    return i2c_read((uint8_t*)&cmd, 2, nullptr, 0);
++}
++
++std::optional<I2cDev_PPmod::predator_ble_record_t> I2cDev_PPmod::predator_ble_get_result(uint16_t index) {
++    if (isLocked()) return std::nullopt;
++    uint32_t data = (uint32_t)Command::COMMAND_PREDATOR_BLE_GETRESULT + ((uint32_t)index << 16);
++    I2cDev_PPmod::predator_ble_record_t rec{};
++    bool success = i2c_read((uint8_t*)&data, sizeof(data), (uint8_t*)&rec, sizeof(rec));
++    if (!success) return std::nullopt;
++    rec.name[sizeof(rec.name) - 1] = 0;
++    return rec;
++}
++
+ bool I2cDev_PPmod::send_poweroff_command() {
+     if (isLocked()) return false;  // device is busy
+     Command cmd = Command::COMMAND_POWER_OFF;
+diff --git a/firmware/common/i2cdev_ppmod.hpp b/firmware/common/i2cdev_ppmod.hpp
+index 1798461..b67126d 100644
+--- a/firmware/common/i2cdev_ppmod.hpp
++++ b/firmware/common/i2cdev_ppmod.hpp
+@@ -61,8 +61,46 @@ class I2cDev_PPmod : public I2cDev {
+         COMMAND_SHELL_MODTOPP_DATA,       // the actual bytes sent by esp. 1st byte's 1st bit is the "hasmore" flag, the remaining 7 bits are the size of the data. exactly 64 byte follows.
+         // poweroff command
+         COMMAND_POWER_OFF,  // requests power off from the esp, and after it needs a full power cycle to get it back again
++
++        // Predator app: WiFi scan commands (module firmware feature, reserved range - keep in sync with mayhem-mdk pp_commands.hpp)
++        COMMAND_PREDATOR_WIFI_STARTSCAN = 0xa008,
++        COMMAND_PREDATOR_WIFI_STOPSCAN = 0xa009,
++        COMMAND_PREDATOR_WIFI_GETRESULT = 0xa00a,
++        // Predator app: BLE scan commands
++        COMMAND_PREDATOR_BLE_STARTSCAN = 0xa00e,
++        COMMAND_PREDATOR_BLE_STOPSCAN = 0xa00f,
++        COMMAND_PREDATOR_BLE_GETRESULT = 0xa010,
+     };
+ 
++    // One Wi-Fi access point found by a scan. Fetched one record at a time by index.
++    // valid == 0 means "no such index" (scan not finished / index out of range).
++    // NB: packed and field-for-field identical to the module firmware's
++    // matching struct (predator_wifi.hpp in the ESP32-S3 project) - this is
++    // memcpy'd raw across the I2C link between two different compilers, so
++    // the layout must match exactly on both ends.
++    typedef struct __attribute__((packed)) {
++        uint16_t total_count;  // number of APs found once the scan is complete
++        uint16_t index;        // index of this record, echoed back
++        uint8_t valid;         // 1 if this record holds real data
++        int8_t rssi;           // dBm
++        uint8_t channel;
++        uint8_t authmode;  // 0=open,1=WEP,2=WPA-PSK,3=WPA2-PSK,4=WPA/WPA2-PSK,5=WPA2-ENT,6=WPA3-PSK,7=WPA2/WPA3-PSK,8=WAPI
++        uint8_t bssid[6];
++        char ssid[33];
++    } predator_wifi_record_t;
++
++    // One BLE advertiser found by a scan. Fetched one record at a time by index.
++    // Same packed/matching-layout requirement as predator_wifi_record_t above.
++    typedef struct __attribute__((packed)) {
++        uint16_t total_count;
++        uint16_t index;
++        uint8_t valid;
++        int8_t rssi;
++        uint8_t addr_type;  // 0=public,1=random,2=rpa_public,3=rpa_random
++        uint8_t addr[6];
++        char name[32];  // may be empty if the advertisement carried no name
++    } predator_ble_record_t;
++
+     typedef struct {
+         uint32_t api_version;
+         uint32_t module_version;
+@@ -95,6 +133,22 @@ class I2cDev_PPmod : public I2cDev {
+ 
+     bool send_poweroff_command();  // sends the command to power off the device. Restarting the esp needs a full power cycle!
+ 
++    // --- Predator app support -------------------------------------------------
++    // WiFi scanning uses the module's own WiFi radio (ESP32-S3). RX only: this
++    // starts a passive scan and lets the caller page through the results; it
++    // never associates, transmits probe floods, or otherwise touches a network.
++    bool predator_wifi_start_scan();
++    bool predator_wifi_stop_scan();
++    // Fetch one result by index (0..total_count-1). Poll with increasing index
++    // until returned record.valid == 0 or index >= record.total_count.
++    std::optional<predator_wifi_record_t> predator_wifi_get_result(uint16_t index);
++
++    // BLE discovery uses the module's BLE radio. RX only: passive advertisement
++    // scanning, no connections are made.
++    bool predator_ble_start_scan();
++    bool predator_ble_stop_scan();
++    std::optional<predator_ble_record_t> predator_ble_get_result(uint16_t index);
++
+    private:
+     uint8_t self_timer = 0;
+     uint64_t mask = 0;  // feauture mask, that indicates what the device can do. this will determinate what we will query from the device
+diff --git a/firmware/tools/external_app_info.py b/firmware/tools/external_app_info.py
+index 390d66f..f636580 100644
+--- a/firmware/tools/external_app_info.py
++++ b/firmware/tools/external_app_info.py
+@@ -25,4 +25,4 @@
+ # The end address is exclusive.
+ maximum_application_size = 32*1024
+ external_apps_address_start = 0xADB00000
+-external_apps_address_end = 0xAE108000
++external_apps_address_end = 0xAE118000

@@ -1,0 +1,20 @@
+# Predator MDK module firmware - non-interactive Kconfig defaults.
+#
+# Enables Bluetooth with the NimBLE host stack for passive BLE GAP
+# discovery only (see main/predator_ble.cpp). Written as sdkconfig.defaults
+# rather than hand-edited into sdkconfig directly, because BT_ENABLED /
+# BT_HOST / BT_CONTROLLER are Kconfig "choice" groups - editing the
+# generated sdkconfig by hand without updating every choice member
+# consistently gets silently reverted by the next confgen/reconfigure
+# pass. sdkconfig.defaults is merged in properly by kconfgen, so delete
+# the generated sdkconfig (and sdkconfig.old) before rebuilding so it
+# regenerates from these defaults.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+
+# WiFi scan + NimBLE together push the app binary past the stock 1MB
+# single-app partition (~1.09MB). The board has 2MB flash, so switch to
+# the "single app, large" partition table (1500K factory app) instead of
+# hand-rolling a custom partitions.csv.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
